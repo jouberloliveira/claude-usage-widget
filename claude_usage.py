@@ -9,6 +9,7 @@ to call the internal subscription endpoints. No Anthropic API key required.
 import errno
 import http.server
 import json
+import re
 import sys
 import threading
 import urllib.error
@@ -330,6 +331,62 @@ def _claude_request(path: str, session_key: str) -> dict:
         return json.loads(resp.read())
 
 
+def _claude_fetch_html(path: str, session_key: str) -> str:
+    url = f"{CLAUDE_BASE}{path}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Cookie": f"sessionKey={session_key}",
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml",
+            "Referer": f"{CLAUDE_BASE}/",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+_NEXT_DATA_RE = re.compile(
+    r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+    re.DOTALL,
+)
+
+
+def _scrape_next_data(html: str) -> dict:
+    m = _NEXT_DATA_RE.search(html)
+    if not m:
+        return {}
+    try:
+        return json.loads(m.group(1))
+    except Exception:
+        return {}
+
+
+def _find_usage_node(obj):
+    """Walk a Next.js data tree and find the first dict that looks like the usage payload.
+
+    Targets a dict whose values include at least one nested dict with `utilization`
+    (matching the claude.ai live-UI shape: five_hour/seven_day with utilization+resets_at).
+    """
+    stack = [obj]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            hits = 0
+            for v in node.values():
+                if isinstance(v, dict) and ("utilization" in v or "resets_at" in v):
+                    hits += 1
+                    if hits >= 2:
+                        return node
+            for v in node.values():
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+        elif isinstance(node, list):
+            stack.extend(node)
+    return None
+
+
 _WINDOW_LABELS = {
     "five_hour": "Janela 5h",
     "seven_day": "Janela 7 dias",
@@ -546,6 +603,50 @@ def fetch_subscription_usage(session_key: str) -> dict:
             best_score = score
             usage_raw = data
             used_path = p
+
+    # Fallback: scrape SSR HTML pages — claude.ai renders usage in __NEXT_DATA__
+    # without a separate XHR call, so the live numbers may only exist there.
+    html_paths = ["/settings/usage", "/usage", "/settings/billing"]
+    for hp in html_paths:
+        try:
+            html = _claude_fetch_html(hp, session_key)
+        except Exception as e:
+            attempts.append({"path": hp, "error": f"html: {e}"})
+            continue
+        nd = _scrape_next_data(html)
+        if not nd:
+            attempts.append({"path": hp, "html": True, "next_data": False})
+            continue
+        node = _find_usage_node(nd)
+        if not node:
+            attempts.append({
+                "path": hp,
+                "html": True,
+                "next_data": True,
+                "usage_node": False,
+                "top_keys": list(nd.keys())[:20],
+            })
+            continue
+        b = _normalize_buckets(node)
+        nonzero = sum(
+            1 for x in b
+            if (isinstance(x.get("utilization"), (int, float)) and x["utilization"] > 0)
+            or (isinstance(x.get("used"), (int, float)) and x["used"] > 0)
+        )
+        attempts.append({
+            "path": hp,
+            "html": True,
+            "next_data": True,
+            "usage_node": True,
+            "bucket_count": len(b),
+            "nonzero_buckets": nonzero,
+            "sample": _truncate_sample(node),
+        })
+        score = nonzero * 1000 + len(b)
+        if score > best_score:
+            best_score = score
+            usage_raw = node
+            used_path = f"{hp} (SSR __NEXT_DATA__)"
 
     buckets = _normalize_buckets(usage_raw) if usage_raw else []
     raw_keys = list(usage_raw.keys()) if isinstance(usage_raw, dict) else []
