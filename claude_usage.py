@@ -6,8 +6,10 @@ Run: python3 claude_usage.py
 Auth: uses the `sessionKey` cookie from a browser logged into claude.ai
 to call the internal subscription endpoints. No Anthropic API key required.
 """
+import errno
 import http.server
 import json
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -463,9 +465,35 @@ def _http_error(e: urllib.error.HTTPError, path: str) -> dict:
     return {"error": f"HTTP {e.code} em {path}: {body}"}
 
 
+class ReusableHTTPServer(http.server.HTTPServer):
+    allow_reuse_address = True
+
+
+def _bind_server(start_port: int, attempts: int = 11):
+    for offset in range(attempts):
+        port = start_port + offset
+        try:
+            server = ReusableHTTPServer(("127.0.0.1", port), Handler)
+        except OSError as exc:
+            if exc.errno in (errno.EADDRINUSE, errno.EACCES):
+                continue
+            raise
+        if port != start_port:
+            print(f"  ⚠ Porta {start_port} ocupada, usando {port}")
+        return server, port
+    return None, None
+
+
 def main():
-    server = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
-    url = f"http://127.0.0.1:{PORT}"
+    server, port = _bind_server(PORT)
+    if server is None:
+        print(
+            f"\n  ✗ Erro: nenhuma porta livre no intervalo {PORT}-{PORT + 10}.\n"
+            f"  Encerre o processo que está usando a porta {PORT} e tente novamente.\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    url = f"http://127.0.0.1:{port}"
     print(f"\n  Claude Usage Widget")
     print(f"  -------------------")
     print(f"  Abrindo {url}")
