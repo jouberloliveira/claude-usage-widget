@@ -324,6 +324,13 @@ _WINDOW_LABELS = {
     "seven_day": "Janela 7 dias",
     "seven_day_opus": "Opus · 7 dias",
     "seven_day_sonnet": "Sonnet · 7 dias",
+    "seven_day_oauth_apps": "OAuth Apps · 7 dias",
+    "seven_day_cowork": "Co-work · 7 dias",
+    "seven_day_omelette": "Omelette · 7 dias",
+    "tangelo": "Tangelo",
+    "iguana_necktie": "Iguana Necktie",
+    "omelette_promotional": "Omelette Promo",
+    "extra_usage": "Uso Extra",
     "weekly": "Semanal",
     "daily": "Diário",
     "monthly": "Mensal",
@@ -393,6 +400,29 @@ def _normalize_buckets(raw) -> list:
             "limit": limit,
             "utilization": utilization,
             "resets_at": reset,
+            "unit": "msgs",
+        })
+
+    # claude.ai /usage shape: bare keys {utilization, resets_at}
+    for k, v in raw.items():
+        if not isinstance(v, dict):
+            continue
+        if k.endswith(("_limit_window", "_window")):
+            continue
+        if "utilization" not in v and "resets_at" not in v and "used" not in v:
+            continue
+        label = _label_for(k)
+        if any(b["label"] == label for b in buckets):
+            continue
+        utilization = v.get("utilization")
+        if utilization is not None and isinstance(utilization, (int, float)) and utilization <= 1:
+            utilization = utilization * 100
+        buckets.append({
+            "label": label,
+            "used": v.get("used", v.get("usage")),
+            "limit": v.get("limit", v.get("max")),
+            "utilization": utilization,
+            "resets_at": v.get("resets_at") or v.get("reset_at"),
             "unit": "msgs",
         })
 
