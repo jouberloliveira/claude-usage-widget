@@ -230,24 +230,30 @@ function renderResults(d) {
     for (const b of buckets) {
       const used = b.used ?? 0;
       const limit = b.limit ?? 0;
-      const p = pct(used, limit);
+      const hasPct = typeof b.utilization === 'number';
+      const p = hasPct ? Math.round(b.utilization) : pct(used, limit);
       const [cc, bc] = colorClass(p);
       const reset = fmtReset(b.resets_at);
+      const valueDisplay = hasPct && !limit ? `${p}%` : fmt(used);
+      const subDisplay = hasPct && !limit
+        ? `${p}% utilizado`
+        : `de ${fmt(limit)} ${b.unit || ''} · ${p}% usado`;
       html += `
       <div class="metric">
         <div class="label">${b.label}</div>
-        <div class="value ${cc}">${fmt(used)}</div>
-        <div class="sub">de ${fmt(limit)} ${b.unit || ''} · ${p}% usado</div>
+        <div class="value ${cc}">${valueDisplay}</div>
+        <div class="sub">${subDisplay}</div>
         <div class="bar-wrap"><div class="bar ${bc}" style="width:${p}%"></div></div>
         <div class="sub" style="margin-top:.6rem">Reset em: ${reset}</div>
       </div>`;
     }
     html += '</div>';
   } else {
-    html += '<div class="error">claude.ai não retornou nenhum bucket de uso para esta conta.</div>';
+    const keys = (d.raw_keys && d.raw_keys.length) ? d.raw_keys.join(', ') : '(nenhuma)';
+    html += `<div class="error">⚠ Sem dados de uso reconhecidos. Chaves retornadas pela API: <code style="background:#0f0f18;padding:.1rem .35rem;border-radius:4px">${keys}</code><br><br>Endpoint consultado: <code style="background:#0f0f18;padding:.1rem .35rem;border-radius:4px">${d.usage_path || '—'}</code>${d.warning ? '<br><br>'+d.warning : ''}</div>`;
   }
 
-  if (d.raw_keys && d.raw_keys.length) {
+  if (d.raw_keys && d.raw_keys.length && buckets.length) {
     html += `<div class="section-title">Campos brutos detectados</div><div class="info-card">`;
     html += `<div class="info-row"><span class="info-key">keys</span><span class="info-val">${d.raw_keys.join(', ')}</span></div>`;
     html += '</div>';
@@ -311,11 +317,31 @@ def _claude_request(path: str, session_key: str) -> dict:
         return json.loads(resp.read())
 
 
+_WINDOW_LABELS = {
+    "five_hour": "Janela 5h",
+    "seven_day": "Janela 7 dias",
+    "seven_day_opus": "Opus · 7 dias",
+    "seven_day_sonnet": "Sonnet · 7 dias",
+    "weekly": "Semanal",
+    "daily": "Diário",
+    "monthly": "Mensal",
+    "hourly": "Hora",
+}
+
+
+def _label_for(name: str) -> str:
+    base = name.replace("_limit_window", "").replace("_window", "")
+    return _WINDOW_LABELS.get(base, base.replace("_", " ").title())
+
+
 def _normalize_buckets(raw) -> list:
     """Map heterogeneous usage_limit shapes into a flat list of buckets.
 
-    claude.ai has shipped several shapes for this endpoint; we look for the
-    common keys without hard-coding a single schema.
+    Supports:
+      - list-shaped: usage_limits / limits / buckets / rate_limits
+      - dict-shaped: same keys mapping name -> {used, limit, ...}
+      - flat prefix pairs: {five_hour_used, five_hour_limit, ...}
+      - claude.ai subscription shape: {five_hour_limit_window: {utilization, resets_at}, ...}
     """
     buckets = []
     if not isinstance(raw, dict):
@@ -329,29 +355,44 @@ def _normalize_buckets(raw) -> list:
         elif isinstance(v, dict):
             for name, item in v.items():
                 if isinstance(item, dict):
-                    item = {**item, "_name": name}
-                    candidates.append(item)
+                    candidates.append({**item, "_name": name})
 
-    # Fallback: treat top-level numeric-pair entries (e.g. five_hour_limit / used)
-    for prefix in ("five_hour", "seven_day", "weekly", "daily", "monthly"):
+    for prefix in ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet",
+                   "weekly", "daily", "monthly", "hourly"):
         used = raw.get(f"{prefix}_used") or raw.get(f"{prefix}_usage")
         limit = raw.get(f"{prefix}_limit")
         reset = raw.get(f"{prefix}_resets_at") or raw.get(f"{prefix}_reset_at")
         if used is not None or limit is not None:
-            label_map = {
-                "five_hour": "Janela 5h",
-                "seven_day": "Janela 7 dias",
-                "weekly": "Semanal",
-                "daily": "Diário",
-                "monthly": "Mensal",
-            }
             buckets.append({
-                "label": label_map[prefix],
+                "label": _WINDOW_LABELS.get(prefix, prefix.title()),
                 "used": used,
                 "limit": limit,
                 "resets_at": reset,
                 "unit": "msgs",
             })
+
+    # claude.ai subscription shape: *_limit_window: {utilization, resets_at}
+    for k, v in raw.items():
+        if not isinstance(v, dict):
+            continue
+        if not (k.endswith("_limit_window") or k.endswith("_window")):
+            continue
+        if "utilization" not in v and "resets_at" not in v and "used" not in v:
+            continue
+        utilization = v.get("utilization")
+        used = v.get("used", v.get("usage"))
+        limit = v.get("limit", v.get("max"))
+        reset = v.get("resets_at") or v.get("reset_at")
+        if utilization is not None and isinstance(utilization, (int, float)) and utilization <= 1:
+            utilization = utilization * 100
+        buckets.append({
+            "label": _label_for(k),
+            "used": used,
+            "limit": limit,
+            "utilization": utilization,
+            "resets_at": reset,
+            "unit": "msgs",
+        })
 
     for item in candidates:
         if not isinstance(item, dict):
@@ -367,11 +408,15 @@ def _normalize_buckets(raw) -> list:
         used = item.get("used", item.get("usage", item.get("current")))
         limit = item.get("limit", item.get("max", item.get("cap")))
         reset = item.get("resets_at") or item.get("reset_at") or item.get("resets")
+        utilization = item.get("utilization")
+        if utilization is not None and isinstance(utilization, (int, float)) and utilization <= 1:
+            utilization = utilization * 100
         unit = item.get("unit") or "msgs"
         buckets.append({
             "label": str(label).replace("_", " ").title(),
             "used": used,
             "limit": limit,
+            "utilization": utilization,
             "resets_at": reset,
             "unit": unit,
         })
@@ -409,6 +454,8 @@ def fetch_subscription_usage(session_key: str) -> dict:
         f"/api/organizations/{org_id}/usage_limit",
         f"/api/organizations/{org_id}/usage",
         f"/api/organizations/{org_id}/rate_limits",
+        f"/api/bootstrap/{org_id}/statsig",
+        f"/api/account",
     ]
     usage_raw = None
     used_path = None
