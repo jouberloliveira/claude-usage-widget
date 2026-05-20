@@ -2,17 +2,23 @@
 """
 Claude Usage Widget — zero external dependencies, Python 3.8+
 Run: python3 claude_usage.py
+
+Auth: uses the `sessionKey` cookie from a browser logged into claude.ai
+to call the internal subscription endpoints. No Anthropic API key required.
 """
 import http.server
 import json
-import os
 import threading
 import urllib.error
 import urllib.request
 import webbrowser
-from urllib.parse import parse_qs, urlparse
 
 PORT = 7432
+CLAUDE_BASE = "https://claude.ai"
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 HTML = """<!DOCTYPE html>
 <html lang="pt-BR">
@@ -57,13 +63,9 @@ HTML = """<!DOCTYPE html>
   button:hover { opacity: .85; }
   button:disabled { opacity: .4; cursor: not-allowed; }
 
-  .model-select { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: 1rem; }
-  .model-btn {
-    background: #0f0f18; border: 1px solid var(--border); border-radius: 6px;
-    color: var(--muted); padding: .35rem .85rem; font-size: .8rem; cursor: pointer;
-    transition: all .15s;
-  }
-  .model-btn.active { border-color: var(--accent2); color: var(--text); background: #1e1e2e; }
+  .help { font-size: .78rem; color: var(--muted); margin-top: .75rem; line-height: 1.5; }
+  .help code { background: #0f0f18; padding: .1rem .35rem; border-radius: 4px; color: #c8c8d8; }
+  .help ol { padding-left: 1.2rem; margin-top: .35rem; }
 
   #results { max-width: 560px; margin: 0 auto; }
   .section-title { font-size: .8rem; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin-bottom: .75rem; }
@@ -87,12 +89,6 @@ HTML = """<!DOCTYPE html>
   .tier-pro { background: #1e2a3a; color: #5a9fd4; }
   .tier-max5 { background: #2a1e3a; color: #a07cd4; }
   .tier-max20 { background: #3a1e2a; color: #d47ca0; }
-  .tier-api { background: #1e3a2a; color: #5ad49f; }
-
-  .reset-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem 1.25rem; margin-bottom: 1.5rem; display: flex; align-items: center; gap: 1rem; }
-  .reset-icon { font-size: 1.4rem; }
-  .reset-label { font-size: .8rem; color: var(--muted); }
-  .reset-value { font-size: 1rem; font-weight: 600; }
 
   .info-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem 1.25rem; margin-bottom: 1.5rem; }
   .info-row { display: flex; justify-content: space-between; align-items: center; padding: .45rem 0; border-bottom: 1px solid var(--border); font-size: .9rem; }
@@ -119,67 +115,49 @@ HTML = """<!DOCTYPE html>
 <body>
 
 <h1>Claude <span>Usage</span> Widget</h1>
-<p class="subtitle">Monitore limites e gastos da sua subscription em tempo real</p>
+<p class="subtitle">Monitore limites e gastos da sua subscription Pro/Max</p>
 
 <div class="card">
-  <label>Anthropic API Key</label>
+  <label>Session Key (cookie <code>sessionKey</code> do claude.ai)</label>
   <div class="row">
-    <input type="password" id="apiKey" placeholder="sk-ant-api03-..." autocomplete="off">
+    <input type="password" id="sessionKey" placeholder="sk-ant-sid01-..." autocomplete="off">
     <button id="checkBtn" onclick="checkUsage()">Verificar</button>
   </div>
-  <div class="model-select" id="modelSelect">
-    <span style="font-size:.8rem;color:var(--muted);line-height:2">Modelo:</span>
-    <button class="model-btn active" data-model="claude-sonnet-4-5">Sonnet 4.5</button>
-    <button class="model-btn" data-model="claude-opus-4-5">Opus 4.5</button>
-    <button class="model-btn" data-model="claude-haiku-4-5-20251001">Haiku 4.5</button>
+  <div class="help">
+    Como obter:
+    <ol>
+      <li>Faça login em <code>https://claude.ai</code></li>
+      <li>Abra DevTools (F12) → <b>Application</b> → <b>Cookies</b> → <code>https://claude.ai</code></li>
+      <li>Copie o valor do cookie <code>sessionKey</code> (começa com <code>sk-ant-sid01-</code>)</li>
+    </ol>
+    A chave fica apenas no <code>localStorage</code> do browser. Nada é enviado fora da sua máquina exceto para o próprio <code>claude.ai</code>.
   </div>
 </div>
 
 <div id="results"></div>
 
-<p class="footnote">Dados obtidos via headers de rate-limit da Anthropic API · Nenhuma chave é salva no servidor</p>
+<p class="footnote">Dados obtidos via APIs internas de claude.ai · Auth por cookie de sessão</p>
 
 <script>
-let savedKey = localStorage.getItem('claude_api_key') || '';
-let selectedModel = 'claude-sonnet-4-5';
-if (savedKey) document.getElementById('apiKey').value = savedKey;
-
-document.querySelectorAll('.model-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.model-btn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    selectedModel = btn.dataset.model;
-  });
-});
+let savedKey = localStorage.getItem('claude_session_key') || '';
+if (savedKey) document.getElementById('sessionKey').value = savedKey;
 
 function fmt(n) {
-  if (!n && n !== 0) return '—';
+  if (n === null || n === undefined) return '—';
   if (n >= 1_000_000) return (n/1_000_000).toFixed(1)+'M';
   if (n >= 1_000) return (n/1_000).toFixed(0)+'K';
   return n.toString();
 }
 
-function pct(remaining, limit) {
+function pct(used, limit) {
   if (!limit) return 0;
-  return Math.round(((limit - remaining) / limit) * 100);
+  return Math.max(0, Math.min(100, Math.round((used / limit) * 100)));
 }
 
-function colorClass(used) {
-  if (used < 60) return ['color-green', 'bar-green'];
-  if (used < 85) return ['color-yellow', 'bar-yellow'];
+function colorClass(p) {
+  if (p < 60) return ['color-green', 'bar-green'];
+  if (p < 85) return ['color-yellow', 'bar-yellow'];
   return ['color-red', 'bar-red'];
-}
-
-function detectTier(limits) {
-  // Heuristic from public Anthropic rate-limit docs
-  const rpm = limits.requestsPerMinute;
-  const tpm = limits.tokensPerMinute;
-  if (!rpm && !tpm) return {label:'Desconhecido', cls:'tier-free'};
-  if (tpm >= 200_000) return {label:'Max 20', cls:'tier-max20'};
-  if (tpm >= 40_000) return {label:'Max 5', cls:'tier-max5'};
-  if (tpm >= 20_000) return {label:'Pro', cls:'tier-pro'};
-  if (tpm >= 8_000) return {label:'Free', cls:'tier-free'};
-  return {label:'API', cls:'tier-api'};
 }
 
 function fmtReset(iso) {
@@ -191,24 +169,34 @@ function fmtReset(iso) {
     if (diff <= 0) return 'agora';
     if (diff < 60) return diff+'s';
     if (diff < 3600) return Math.ceil(diff/60)+'min';
-    return d.toLocaleTimeString('pt-BR', {hour:'2-digit', minute:'2-digit'});
+    if (diff < 86400) return Math.ceil(diff/3600)+'h';
+    return d.toLocaleString('pt-BR', {day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit'});
   } catch { return iso; }
 }
 
+function tierBadge(t) {
+  if (!t) return '<span class="tier-badge tier-free">—</span>';
+  const k = String(t).toLowerCase();
+  if (k.includes('max') && k.includes('20')) return '<span class="tier-badge tier-max20">Max 20</span>';
+  if (k.includes('max')) return '<span class="tier-badge tier-max5">Max 5</span>';
+  if (k.includes('pro')) return '<span class="tier-badge tier-pro">Pro</span>';
+  return '<span class="tier-badge tier-free">'+t+'</span>';
+}
+
 async function checkUsage() {
-  const key = document.getElementById('apiKey').value.trim();
-  if (!key) { showError('Informe a API Key'); return; }
-  localStorage.setItem('claude_api_key', key);
+  const key = document.getElementById('sessionKey').value.trim();
+  if (!key) { showError('Informe o sessionKey'); return; }
+  localStorage.setItem('claude_session_key', key);
 
   const btn = document.getElementById('checkBtn');
   btn.disabled = true; btn.textContent = '...';
-  document.getElementById('results').innerHTML = '<div class="spinner">Consultando API...</div>';
+  document.getElementById('results').innerHTML = '<div class="spinner">Consultando claude.ai...</div>';
 
   try {
     const resp = await fetch('/api/check', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({key, model: selectedModel})
+      body: JSON.stringify({sessionKey: key})
     });
     const data = await resp.json();
     if (data.error) { showError(data.error); return; }
@@ -225,55 +213,43 @@ function showError(msg) {
 }
 
 function renderResults(d) {
-  const tier = detectTier(d.limits || {});
-  const lim = d.limits || {};
-  const rem = d.remaining || {};
-  const resets = d.resets || {};
-
-  function metric(label, used, remaining, limit, unit='tokens') {
-    const p = pct(remaining, limit);
-    const [cc, bc] = colorClass(p);
-    return `
-    <div class="metric">
-      <div class="label">${label}</div>
-      <div class="value ${cc}">${fmt(remaining)}</div>
-      <div class="sub">de ${fmt(limit)} ${unit} · ${p}% usado</div>
-      <div class="bar-wrap"><div class="bar ${bc}" style="width:${p}%"></div></div>
-    </div>`;
-  }
+  const org = d.organization || {};
+  const buckets = d.usage_buckets || [];
 
   let html = `
-  <div class="section-title">Perfil da chave</div>
+  <div class="section-title">Organização</div>
   <div class="info-card">
-    <div class="info-row"><span class="info-key">Tier detectado</span><span class="info-val"><span class="tier-badge ${tier.cls}">${tier.label}</span></span></div>
-    <div class="info-row"><span class="info-key">Modelo testado</span><span class="info-val">${d.model || selectedModel}</span></div>
-    <div class="info-row"><span class="info-key">Input tokens usados</span><span class="info-val">${fmt(d.usage?.input_tokens)}</span></div>
-    <div class="info-row"><span class="info-key">Output tokens usados</span><span class="info-val">${fmt(d.usage?.output_tokens)}</span></div>
+    <div class="info-row"><span class="info-key">Nome</span><span class="info-val">${org.name || '—'}</span></div>
+    <div class="info-row"><span class="info-key">Plano</span><span class="info-val">${tierBadge(org.tier)}</span></div>
+    <div class="info-row"><span class="info-key">Org ID</span><span class="info-val">${(org.uuid || '').slice(0,8) || '—'}</span></div>
     <div class="info-row"><span class="info-key">Atualizado em</span><span class="info-val">${new Date().toLocaleTimeString('pt-BR')}</span></div>
   </div>`;
 
-  if (lim.tokensPerMinute || lim.requestsPerMinute) {
-    html += '<div class="section-title">Limites por Minuto</div><div class="metric-grid">';
-    if (lim.tokensPerMinute) html += metric('Tokens / min (restante)', pct(rem.tokensPerMinute, lim.tokensPerMinute), rem.tokensPerMinute, lim.tokensPerMinute);
-    if (lim.requestsPerMinute) html += metric('Requests / min (restante)', pct(rem.requestsPerMinute, lim.requestsPerMinute), rem.requestsPerMinute, lim.requestsPerMinute, 'reqs');
-    html += '</div>';
-  }
-
-  if (lim.tokensPerDay || lim.requestsPerDay) {
-    html += '<div class="section-title">Limites Diários</div><div class="metric-grid">';
-    if (lim.tokensPerDay) html += metric('Tokens / dia (restante)', pct(rem.tokensPerDay, lim.tokensPerDay), rem.tokensPerDay, lim.tokensPerDay);
-    if (lim.requestsPerDay) html += metric('Requests / dia (restante)', pct(rem.requestsPerDay, lim.requestsPerDay), rem.requestsPerDay, lim.requestsPerDay, 'reqs');
-    html += '</div>';
-  }
-
-  // resets
-  const resetEntries = Object.entries(resets).filter(([,v])=>v);
-  if (resetEntries.length) {
-    html += `<div class="section-title">Próximos Resets</div><div class="info-card">`;
-    for (const [k, v] of resetEntries) {
-      const label = k.replace(/([A-Z])/g,' $1').toLowerCase();
-      html += `<div class="info-row"><span class="info-key">${label}</span><span class="info-val">${fmtReset(v)}</span></div>`;
+  if (buckets.length) {
+    html += '<div class="section-title">Uso e Limites</div><div class="metric-grid">';
+    for (const b of buckets) {
+      const used = b.used ?? 0;
+      const limit = b.limit ?? 0;
+      const p = pct(used, limit);
+      const [cc, bc] = colorClass(p);
+      const reset = fmtReset(b.resets_at);
+      html += `
+      <div class="metric">
+        <div class="label">${b.label}</div>
+        <div class="value ${cc}">${fmt(used)}</div>
+        <div class="sub">de ${fmt(limit)} ${b.unit || ''} · ${p}% usado</div>
+        <div class="bar-wrap"><div class="bar ${bc}" style="width:${p}%"></div></div>
+        <div class="sub" style="margin-top:.6rem">Reset em: ${reset}</div>
+      </div>`;
     }
+    html += '</div>';
+  } else {
+    html += '<div class="error">claude.ai não retornou nenhum bucket de uso para esta conta.</div>';
+  }
+
+  if (d.raw_keys && d.raw_keys.length) {
+    html += `<div class="section-title">Campos brutos detectados</div><div class="info-card">`;
+    html += `<div class="info-row"><span class="info-key">keys</span><span class="info-val">${d.raw_keys.join(', ')}</span></div>`;
     html += '</div>';
   }
 
@@ -281,7 +257,6 @@ function renderResults(d) {
   document.getElementById('results').innerHTML = html;
 }
 
-// auto-check if key saved
 if (savedKey) checkUsage();
 </script>
 </body>
@@ -289,7 +264,8 @@ if (savedKey) checkUsage();
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *args): pass  # silence default logs
+    def log_message(self, *args):
+        pass
 
     def do_GET(self):
         self.send_response(200)
@@ -304,11 +280,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(length))
-        api_key = body.get("key", "")
-        model = body.get("model", "claude-sonnet-4-5")
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            body = {}
+        session_key = (body.get("sessionKey") or "").strip()
 
-        result = call_anthropic(api_key, model)
+        result = fetch_subscription_usage(session_key)
         payload = json.dumps(result).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -317,74 +295,172 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
-def call_anthropic(api_key: str, model: str) -> dict:
-    """Make a minimal API call and extract rate-limit headers + usage."""
-    req_body = json.dumps({
-        "model": model,
-        "max_tokens": 1,
-        "messages": [{"role": "user", "content": "hi"}]
-    }).encode()
-
+def _claude_request(path: str, session_key: str) -> dict:
+    url = f"{CLAUDE_BASE}{path}"
     req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=req_body,
+        url,
         headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
+            "Cookie": f"sessionKey={session_key}",
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+            "Referer": f"{CLAUDE_BASE}/",
         },
-        method="POST",
+        method="GET",
     )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read())
 
-    def parse_headers(resp_headers) -> dict:
-        h = {}
-        # rate limit headers
-        mapping = {
-            "anthropic-ratelimit-tokens-limit":         ("limits",    "tokensPerMinute"),
-            "anthropic-ratelimit-tokens-remaining":     ("remaining", "tokensPerMinute"),
-            "anthropic-ratelimit-tokens-reset":         ("resets",    "tokensPerMinute"),
-            "anthropic-ratelimit-requests-limit":       ("limits",    "requestsPerMinute"),
-            "anthropic-ratelimit-requests-remaining":   ("remaining", "requestsPerMinute"),
-            "anthropic-ratelimit-requests-reset":       ("resets",    "requestsPerMinute"),
-            "anthropic-ratelimit-input-tokens-limit":   ("limits",    "inputTokensPerMinute"),
-            "anthropic-ratelimit-input-tokens-remaining":("remaining","inputTokensPerMinute"),
-            "anthropic-ratelimit-input-tokens-reset":   ("resets",    "inputTokensPerMinute"),
-            "anthropic-ratelimit-output-tokens-limit":  ("limits",    "outputTokensPerMinute"),
-            "anthropic-ratelimit-output-tokens-remaining":("remaining","outputTokensPerMinute"),
-            "anthropic-ratelimit-output-tokens-reset":  ("resets",    "outputTokensPerMinute"),
-        }
-        limits, remaining, resets = {}, {}, {}
-        for header_name, (bucket, key) in mapping.items():
-            val = resp_headers.get(header_name)
-            if val is None: continue
-            target = {"limits": limits, "remaining": remaining, "resets": resets}[bucket]
-            try:
-                target[key] = int(val)
-            except ValueError:
-                target[key] = val  # ISO string for reset times
-        return {"limits": limits, "remaining": remaining, "resets": resets}
+
+def _normalize_buckets(raw) -> list:
+    """Map heterogeneous usage_limit shapes into a flat list of buckets.
+
+    claude.ai has shipped several shapes for this endpoint; we look for the
+    common keys without hard-coding a single schema.
+    """
+    buckets = []
+    if not isinstance(raw, dict):
+        return buckets
+
+    candidates = []
+    for key in ("usage_limits", "limits", "buckets", "rate_limits"):
+        v = raw.get(key)
+        if isinstance(v, list):
+            candidates.extend(v)
+        elif isinstance(v, dict):
+            for name, item in v.items():
+                if isinstance(item, dict):
+                    item = {**item, "_name": name}
+                    candidates.append(item)
+
+    # Fallback: treat top-level numeric-pair entries (e.g. five_hour_limit / used)
+    for prefix in ("five_hour", "seven_day", "weekly", "daily", "monthly"):
+        used = raw.get(f"{prefix}_used") or raw.get(f"{prefix}_usage")
+        limit = raw.get(f"{prefix}_limit")
+        reset = raw.get(f"{prefix}_resets_at") or raw.get(f"{prefix}_reset_at")
+        if used is not None or limit is not None:
+            label_map = {
+                "five_hour": "Janela 5h",
+                "seven_day": "Janela 7 dias",
+                "weekly": "Semanal",
+                "daily": "Diário",
+                "monthly": "Mensal",
+            }
+            buckets.append({
+                "label": label_map[prefix],
+                "used": used,
+                "limit": limit,
+                "resets_at": reset,
+                "unit": "msgs",
+            })
+
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        label = (
+            item.get("label")
+            or item.get("display_name")
+            or item.get("name")
+            or item.get("_name")
+            or item.get("window")
+            or "Limite"
+        )
+        used = item.get("used", item.get("usage", item.get("current")))
+        limit = item.get("limit", item.get("max", item.get("cap")))
+        reset = item.get("resets_at") or item.get("reset_at") or item.get("resets")
+        unit = item.get("unit") or "msgs"
+        buckets.append({
+            "label": str(label).replace("_", " ").title(),
+            "used": used,
+            "limit": limit,
+            "resets_at": reset,
+            "unit": unit,
+        })
+
+    return buckets
+
+
+def fetch_subscription_usage(session_key: str) -> dict:
+    if not session_key:
+        return {"error": "sessionKey vazio."}
+    if not session_key.startswith("sk-ant-sid"):
+        return {"error": "sessionKey inválido. Deve começar com 'sk-ant-sid'."}
 
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            resp_body = json.loads(resp.read())
-            rl = parse_headers(resp.headers)
-            return {
-                "model": model,
-                "usage": resp_body.get("usage", {}),
-                **rl,
-            }
+        orgs = _claude_request("/api/organizations", session_key)
     except urllib.error.HTTPError as e:
-        body_txt = e.read().decode(errors="replace")
-        try:
-            err = json.loads(body_txt)
-            msg = err.get("error", {}).get("message", body_txt)
-        except Exception:
-            msg = body_txt
-        # still extract rate-limit headers if present (e.g. 429)
-        rl = parse_headers(e.headers) if e.headers else {}
-        return {"error": f"HTTP {e.code}: {msg}", **rl}
+        return _http_error(e, "/api/organizations")
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"Falha ao chamar /api/organizations: {e}"}
+
+    if not isinstance(orgs, list) or not orgs:
+        return {"error": "Nenhuma organização encontrada para esta sessão."}
+
+    org = _pick_primary_org(orgs)
+    org_id = org.get("uuid") or org.get("id")
+    if not org_id:
+        return {"error": "Resposta de /api/organizations sem uuid."}
+
+    tier = (
+        org.get("settings", {}).get("rate_limit_tier")
+        if isinstance(org.get("settings"), dict) else None
+    ) or org.get("rate_limit_tier") or org.get("subscription_tier") or org.get("tier")
+
+    usage_paths = [
+        f"/api/organizations/{org_id}/usage_limit",
+        f"/api/organizations/{org_id}/usage",
+        f"/api/organizations/{org_id}/rate_limits",
+    ]
+    usage_raw = None
+    used_path = None
+    last_err = None
+    for p in usage_paths:
+        try:
+            usage_raw = _claude_request(p, session_key)
+            used_path = p
+            break
+        except urllib.error.HTTPError as e:
+            last_err = (p, e.code)
+            continue
+        except Exception as e:
+            last_err = (p, str(e))
+            continue
+
+    buckets = _normalize_buckets(usage_raw) if usage_raw else []
+    raw_keys = list(usage_raw.keys()) if isinstance(usage_raw, dict) else []
+
+    return {
+        "organization": {
+            "uuid": org_id,
+            "name": org.get("name"),
+            "tier": tier,
+        },
+        "usage_buckets": buckets,
+        "usage_path": used_path,
+        "raw_keys": raw_keys,
+        "warning": (
+            f"Endpoint de uso indisponível (último erro: {last_err})."
+            if not usage_raw else None
+        ),
+    }
+
+
+def _pick_primary_org(orgs: list) -> dict:
+    for o in orgs:
+        caps = o.get("capabilities") or []
+        if any("claude_pro" in c or "claude_max" in c or "chat" in c for c in caps):
+            return o
+    return orgs[0]
+
+
+def _http_error(e: urllib.error.HTTPError, path: str) -> dict:
+    body = ""
+    try:
+        body = e.read().decode(errors="replace")[:200]
+    except Exception:
+        pass
+    if e.code in (401, 403):
+        return {"error": f"sessionKey rejeitado por claude.ai ({e.code}). Refaça login e copie o cookie novamente."}
+    return {"error": f"HTTP {e.code} em {path}: {body}"}
 
 
 def main():
