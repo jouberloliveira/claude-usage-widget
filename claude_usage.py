@@ -258,7 +258,18 @@ function renderResults(d) {
   if (d.raw_keys && d.raw_keys.length && buckets.length) {
     html += `<div class="section-title">Campos brutos detectados</div><div class="info-card">`;
     html += `<div class="info-row"><span class="info-key">keys</span><span class="info-val">${d.raw_keys.join(', ')}</span></div>`;
+    html += `<div class="info-row"><span class="info-key">endpoint</span><span class="info-val">${d.usage_path || '—'}</span></div>`;
     html += '</div>';
+  }
+
+  if (d.raw_payload) {
+    const payloadJson = JSON.stringify(d.raw_payload, null, 2);
+    const attemptsJson = d.attempts ? JSON.stringify(d.attempts, null, 2) : '';
+    html += `<details style="max-width:560px;margin:0 auto 1.5rem;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:1rem 1.25rem"><summary style="cursor:pointer;color:var(--muted);font-size:.85rem">Debug: payload bruto</summary><pre style="margin-top:.75rem;font-size:.72rem;color:#c8c8d8;background:#0f0f18;padding:.75rem;border-radius:6px;overflow:auto;max-height:300px">${payloadJson.replace(/</g,'&lt;')}</pre>`;
+    if (attemptsJson) {
+      html += `<div class="section-title" style="margin-top:.75rem">Endpoints tentados</div><pre style="font-size:.72rem;color:#c8c8d8;background:#0f0f18;padding:.75rem;border-radius:6px;overflow:auto;max-height:200px">${attemptsJson.replace(/</g,'&lt;')}</pre>`;
+    }
+    html += `</details>`;
   }
 
   html += `<button class="refresh-btn" onclick="checkUsage()">↻ Atualizar</button>`;
@@ -483,8 +494,8 @@ def fetch_subscription_usage(session_key: str) -> dict:
     ) or org.get("rate_limit_tier") or org.get("subscription_tier") or org.get("tier")
 
     usage_paths = [
-        f"/api/organizations/{org_id}/usage_limit",
         f"/api/organizations/{org_id}/usage",
+        f"/api/organizations/{org_id}/usage_limit",
         f"/api/organizations/{org_id}/rate_limits",
         f"/api/bootstrap/{org_id}/statsig",
         f"/api/account",
@@ -492,17 +503,27 @@ def fetch_subscription_usage(session_key: str) -> dict:
     usage_raw = None
     used_path = None
     last_err = None
+    attempts = []
     for p in usage_paths:
         try:
-            usage_raw = _claude_request(p, session_key)
-            used_path = p
-            break
+            data = _claude_request(p, session_key)
         except urllib.error.HTTPError as e:
             last_err = (p, e.code)
+            attempts.append({"path": p, "error": f"HTTP {e.code}"})
             continue
         except Exception as e:
             last_err = (p, str(e))
+            attempts.append({"path": p, "error": str(e)})
             continue
+        b = _normalize_buckets(data)
+        attempts.append({"path": p, "bucket_count": len(b)})
+        if b:
+            usage_raw = data
+            used_path = p
+            break
+        if usage_raw is None:
+            usage_raw = data
+            used_path = p
 
     buckets = _normalize_buckets(usage_raw) if usage_raw else []
     raw_keys = list(usage_raw.keys()) if isinstance(usage_raw, dict) else []
@@ -516,6 +537,8 @@ def fetch_subscription_usage(session_key: str) -> dict:
         "usage_buckets": buckets,
         "usage_path": used_path,
         "raw_keys": raw_keys,
+        "raw_payload": usage_raw if isinstance(usage_raw, dict) else None,
+        "attempts": attempts,
         "warning": (
             f"Endpoint de uso indisponível (último erro: {last_err})."
             if not usage_raw else None
