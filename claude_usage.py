@@ -496,7 +496,17 @@ def fetch_subscription_usage(session_key: str) -> dict:
     usage_paths = [
         f"/api/organizations/{org_id}/usage",
         f"/api/organizations/{org_id}/usage_limit",
+        f"/api/organizations/{org_id}/usage_limits",
         f"/api/organizations/{org_id}/rate_limits",
+        f"/api/organizations/{org_id}/rate_limit_status",
+        f"/api/organizations/{org_id}/rate_limit_state",
+        f"/api/organizations/{org_id}/subscription_usage",
+        f"/api/organizations/{org_id}/chat_conversations_usage",
+        f"/api/organizations/{org_id}/usage_dashboard",
+        f"/api/organizations/{org_id}/quota",
+        f"/api/organizations/{org_id}/limits",
+        f"/api/organizations/{org_id}/billing/usage",
+        f"/api/organizations/{org_id}/claude_ai_usage",
         f"/api/bootstrap/{org_id}/statsig",
         f"/api/account",
     ]
@@ -504,6 +514,7 @@ def fetch_subscription_usage(session_key: str) -> dict:
     used_path = None
     last_err = None
     attempts = []
+    best_score = -1
     for p in usage_paths:
         try:
             data = _claude_request(p, session_key)
@@ -516,12 +527,23 @@ def fetch_subscription_usage(session_key: str) -> dict:
             attempts.append({"path": p, "error": str(e)})
             continue
         b = _normalize_buckets(data)
-        attempts.append({"path": p, "bucket_count": len(b)})
-        if b:
-            usage_raw = data
-            used_path = p
-            break
-        if usage_raw is None:
+        nonzero = sum(
+            1 for x in b
+            if (isinstance(x.get("utilization"), (int, float)) and x["utilization"] > 0)
+            or (isinstance(x.get("used"), (int, float)) and x["used"] > 0)
+        )
+        top_keys = list(data.keys()) if isinstance(data, dict) else []
+        sample = data if isinstance(data, dict) else None
+        attempts.append({
+            "path": p,
+            "bucket_count": len(b),
+            "nonzero_buckets": nonzero,
+            "top_keys": top_keys[:30],
+            "sample": _truncate_sample(sample),
+        })
+        score = nonzero * 1000 + len(b)
+        if score > best_score:
+            best_score = score
             usage_raw = data
             used_path = p
 
@@ -544,6 +566,16 @@ def fetch_subscription_usage(session_key: str) -> dict:
             if not usage_raw else None
         ),
     }
+
+
+def _truncate_sample(data, max_len: int = 1500):
+    if data is None:
+        return None
+    try:
+        s = json.dumps(data, default=str)
+    except Exception:
+        return None
+    return s if len(s) <= max_len else s[:max_len] + "...<truncated>"
 
 
 def _pick_primary_org(orgs: list) -> dict:
